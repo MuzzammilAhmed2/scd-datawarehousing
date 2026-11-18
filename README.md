@@ -1,106 +1,70 @@
-## Project: Slowly Changing Dimensions in Snowflake Using Streams and Tasks
+# Slowly Changing Dimensions in Snowflake — Streams, Tasks & Snowpipe
 
-### Introduction
-This project implements a real-time data pipeline for continuous data ingestion and transformation into a Snowflake data warehouse. It leverages various cloud technologies to achieve Change Data Capture (CDC) and Slowly Changing Dimensions (SCD) for historical data management.
+A near-real-time CDC pipeline. Generated customer data flows through Apache NiFi into Amazon S3, Snowpipe loads it into Snowflake, and scheduled tasks maintain an **SCD Type 1** current table and an **SCD Type 2** history table.
 
-### Architecture
-![image](https://github.com/user-attachments/assets/2faee62a-3270-4e17-ae4f-9410163e7713)
+![Architecture](scd-data-warehousing-with-snowflake/architecture.png)
 
+## Architecture
 
-### Tech Stack:
-➔ Languages: Python3, JavaScript, SQL </br>
-➔ Services: NiFi, Amazon S3, Snowflake, Amazon EC2, Docker
+```mermaid
+flowchart LR
+    A[Faker notebook<br/>customer_YYYYMMDDHHMMSS.csv] --> B[Apache NiFi<br/>Docker on EC2]
+    B --> C[(Amazon S3)]
+    C -->|Snowpipe auto_ingest| D[customer_raw<br/>staging]
+    D -->|tsk_scd_raw every 1 min<br/>pdr_scd_demo: MERGE + TRUNCATE| E[customer<br/>SCD Type 1]
+    E -->|Stream: customer_table_changes| F[v_customer_change_data]
+    F -->|tsk_scd_hist every 1 min<br/>MERGE| G[customer_history<br/>SCD Type 2]
+```
 
-### Dataset Description:
-In this project, we use the faker library from Python to generate records of users and store the records in CSV format with the name, including the current system time. The data includes the following parameters:
-- Customer_id
-- First_name
-- Last_name
-- Email
-- Street
-- State
-- Country
+## Tech stack
 
-### Process Flow
-- Data Generation (EC2): Python scripts with Faker generate data and store it in a designated folder.
-- Data Movement (Apache NiFi): Apache NiFi monitors the folder and uploads newly created files to the designated S3 bucket.
-- Data Ingestion (Snowpipe): Snowpipe automatically ingests data from the S3 bucket into a staging table in Snowflake.
-- Data Transformation (Snowflake Stored Procedure): A scheduled task triggers the stored procedure every minute:
-- MERGE Command (CDC): Inserts, updates, or deletes data in the target table based on the staging table.
-- Truncate Staging Table: Prepares the staging table for the next batch of data.
-- Historical Data Management (Snowflake Stream): A Snowflake Stream captures changes to the actual table over time.
-- SCD(Slowly Changing Dimension) Implementation: The captured data populates a historical table designed with SCD techniques.
+- **Snowflake:** Snowpipe, external stage, JavaScript stored procedure, Streams, Tasks, MERGE
+- **Data movement:** Apache NiFi (with ZooKeeper and JupyterLab via Docker Compose)
+- **Cloud:** Amazon S3, Amazon EC2
+- **Data generation:** Python + Faker
+- **Languages:** SQL, Python, JavaScript (stored procedure)
 
-### Key Takeaways:
-- Understanding the basics of SCD and its different types.
-- Visualizing the complete Architecture of the system
-- Understanding the project and how to use AWS EC2 Instance and security groups.
-- Introduction to Docker.
-- Docker Installation and execution.
-- Usage of docker-composer and starting all tools.
-- Creation of Access key.
-- Creation of S3 bucket.
-- Test Data preparation.
-- Understanding basics of NiFi.
-- Integrating NiFi with S3.
-- Implementing NiFi flow setup.
-- Introduction to different Snowflake components.
-- Implementation of different Snowflake components.
-- Implementation of SCD Type-1 and Type-2
+## What it demonstrates
 
-### Benefits
-- Real-time Data Pipeline: Enables near real-time data updates in Snowflake.
-- Change Data Capture (CDC): Ensures the target table reflects the latest data through inserts, updates, and deletes.
-- Slowly Changing Dimensions (SCD): Maintains data integrity in the historical table through SCD techniques.
-- Scalability and Manageability: Cloud-based technologies offer scalability for handling large data volumes.
+- **Data generation:** `faker.ipynb` writes 10,000 fake customer records per run to a timestamped CSV
+- **Ingestion:** an S3 external stage plus a Snowpipe (`auto_ingest = true`) loading `customer_raw`
+- **SCD Type 1:**
+  - stored procedure `pdr_scd_demo()` MERGEs `customer_raw` into `customer`: it updates changed rows, inserts new ones and refreshes `update_timestamp`
+  - it then truncates the staging table
+  - task `tsk_scd_raw` runs it every minute
+- **Change capture:** stream `customer_table_changes` on `customer`
+- **SCD Type 2:**
+  - view `v_customer_change_data` turns stream rows into insert, update and delete actions, using `start_time` / `end_time` / `is_current`
+  - task `tsk_scd_hist` MERGEs them into `customer_history`; deletes are logical, closing the current row
+- **Least-privilege task execution:** a `TASKADMIN` role is granted `EXECUTE TASK`
 
-### FAQs
+## Project structure
 
-#### What is Slowly Changing Dimensions?
-The terms "facts" and "dimensions" are used in data warehousing. A fact is a piece of numerical data, such as a sale or clicks. Facts are stored in fact tables, linked to a variety of dimension tables via foreign keys that act as companion tables to the facts. Dimension Attributes are the different columns in a dimension table that provide descriptive features of the facts.
+```
+scd-data-warehousing-with-snowflake/
+├── architecture.png
+├── faker.ipynb                   # test-data generator
+├── docker_exp/docker-compose.yml # JupyterLab + ZooKeeper + NiFi
+└── sqls/
+    ├── 01 table_creation.sql     # warehouse, db, schema, customer / customer_history / customer_raw, stream
+    ├── 02 data_ingestion.sql     # external stage + Snowpipe
+    ├── 03 scd_type-1.sql         # MERGE, stored procedure, TASKADMIN role, tsk_scd_raw
+    └── 04 scd_type-2.sql         # change-data view, tsk_scd_hist, test DML
+```
 
-A Slowly Changing Dimension (SCD) stores and maintains both current and historical data across time in a data warehouse. It is regarded as one of the essential ETL jobs for monitoring the history of dimension records, and it has been implemented. Customer, geography, and employee are examples of such dimensions.
+## How to run
 
-SCD may be approached in a variety of ways. The most popular ones are:
+1. **Infrastructure:** on an EC2 instance (or locally) with Docker, run `docker compose up -d` in `docker_exp/`. NiFi runs on port 2080 and JupyterLab on 4888. Change `NIFI_SENSITIVE_PROPS_KEY` to your own value.
+2. **Data:** run `faker.ipynb` in JupyterLab to generate CSVs. In NiFi, build a flow (`ListFile` → `FetchFile` → `PutS3Object`) that pushes new files to your bucket.
+3. **Snowflake:** run the scripts in `sqls/` in order, `01` → `04`.
+   - In `02`, put your bucket URL and credentials into the stage, or better, use a storage integration.
+   - Wire the pipe's notification channel to S3 event notifications.
+4. **Start the tasks:** `ALTER TASK tsk_scd_raw RESUME;` and `ALTER TASK tsk_scd_hist RESUME;`. Suspend them when you're done to save credits.
+5. **Test:** run the INSERT / UPDATE / DELETE statements at the top of `04` and query `customer_history`.
 
-- **Type 0**: This is a passive method. When the dimensions change in this approach, no particular
-action is taken. Some dimension data can be kept the same as when it was initially entered,
-while others may be replaced.
+## Possible next steps
 
-- **Type 1**: The new data overwrites the previous data in a Type 1 SCD. As a result, the existing data
-is lost because it is not saved elsewhere. This is the most common sort of dimension one will
-encounter. To make a Type 1 SCD, one does not need to provide further information.
-
-- **Type 2**: The complete history of values is preserved in a Type 2 SCD. The current record is closed
-when the value of a particular attribute changes. With the updated data values, a new record is
-generated, which then becomes the current record. Each record's adequate time and expiry
-time are used to determine the period during which the record was active.
-
-- **Type 3**: For some chosen dimensions, a Type 3 SCD maintains two copies of values. The previous
-and current values of the chosen attribute are saved in each record. When the value of any of
-the chosen attributes changes, the latest value is recorded as the current value, and the
-previous value is saved as the old value in a new column.
-
-#### NiFi
-Apache NiFi is a data logistics platform that automates data transfer across systems. It gives real-time control over data transportation from any source to any destination, making it simple to handle.
-
-#### Docker
-Docker is a containerization platform that is available as an open-source project. It allows developers to bundle programs into containers, which are standardized executable components that combine application source code with the OS libraries and dependencies needed to run that code in any environment.
-
-#### Amazon EC2
-In the Amazon Web Services Cloud, the Amazon Elastic Compute Cloud (Amazon EC2) offers scalable computing capability. The user will not have to buy hardware upfront if Amazon EC2 is used. Amazon EC2 allows developers to launch multiple virtual servers based on usage, set security and networking, and manage storage.
-
-#### Amazon S3
-Amazon S3 is an object storage service that provides manufacturing scalability, data availability, security, and performance. Users may save and retrieve any quantity of data using Amazon S3 at any time and from any location.
-
-#### Snowflake
-Snowflake is a data storage, processing, and analytics platform that blends a unique SQL query engine with a cloud-native architecture. Snowflake delivers all the features of an enterprise analytic database to the user. Snowflake components include:
-- Warehouse/Virtual Warehouse
-- Database and Schema
-- Table
-- View
-- Stored procedure
-- Snowpipe
-- Stream
-- Task
-
+- Swap stage access keys for a storage integration
+- Replace the 1-minute schedule with `WHEN SYSTEM$STREAM_HAS_DATA(...)` to avoid empty runs
+- Add a dbt snapshot version for comparison
+- Make the Type 1 MERGE null-safe (`IS DISTINCT FROM`) so changes to NULL values are caught
